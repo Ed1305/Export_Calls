@@ -1,0 +1,6 @@
+{
+  "name": "Campaign Call Analytics",
+  "description": "Dashboard to parse and analyze call center disposition reports from plain text logs.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
