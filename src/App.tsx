@@ -4,7 +4,8 @@ import { supabase } from './lib/supabase';
 import { 
   Phone, CheckCircle, Clock, Volume2, AlertCircle, 
   Upload, FileText, ChevronDown, ChevronUp, ChevronRight, Trash2, Database,
-  TrendingDown, TrendingUp, Activity, Download, Calendar, PlayCircle, RefreshCw, Cloud
+  TrendingDown, TrendingUp, Activity, Download, Calendar, PlayCircle, RefreshCw, Cloud,
+  Bookmark, X, Save
 } from 'lucide-react';
 
 interface ParsedList {
@@ -32,8 +33,6 @@ interface Report {
   timestamp: number;
   rawText: string;
   metrics: ReportMetrics;
-  startDate: string;
-  endDate: string;
 }
 
 type SortKey = 'listId' | 'calls' | 'sales' | 'conv';
@@ -135,8 +134,15 @@ const parseReportData = (reportText: string): ReportMetrics => {
 };
 
 export default function App() {
-  const [reports, setReports] = useState<Report[]>([]);
-  const [selectedReportId, setSelectedReportId] = useState<string | null>(null);
+  const [reports, setReports] = useState<Report[]>(() => {
+    try { 
+      const stored = localStorage.getItem('analytix_reports'); 
+      return stored ? JSON.parse(stored) : []; 
+    } catch(e) { return []; }
+  });
+  const [selectedReportId, setSelectedReportId] = useState<string | null>(() => {
+    return localStorage.getItem('analytix_selectedReportId') || null;
+  });
   
   // Sorting State
   const [sortKey, setSortKey] = useState<SortKey>('calls');
@@ -146,14 +152,62 @@ export default function App() {
   // Supabase Integration State
   const [isLoadingSupabase, setIsLoadingSupabase] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
-  const [supabaseFiles, setSupabaseFiles] = useState<{bucket: string, name: string, id: string}[]>([]);
+  const [supabaseFiles, setSupabaseFiles] = useState<{bucket: string, name: string, id: string, created_at: string}[]>([]);
   const [syncError, setSyncError] = useState<string | null>(null);
 
+  // Date Range Filter State
+  const [historyStartDate, setHistoryStartDate] = useState<string>(() => localStorage.getItem('analytix_historyStartDate') || '');
+  const [historyEndDate, setHistoryEndDate] = useState<string>(() => localStorage.getItem('analytix_historyEndDate') || '');
+
+  // Saved Filters State
+  const [savedFilters, setSavedFilters] = useState<{id: string, name: string, start: string, end: string}[]>(() => {
+    try {
+      const stored = localStorage.getItem('analytix_savedFilters');
+      return stored ? JSON.parse(stored) : [];
+    } catch(e) { return []; }
+  });
+  const [isSavingFilter, setIsSavingFilter] = useState(false);
+  const [newFilterName, setNewFilterName] = useState('');
+
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Local Storage Effects
+  useEffect(() => { localStorage.setItem('analytix_historyStartDate', historyStartDate); }, [historyStartDate]);
+  useEffect(() => { localStorage.setItem('analytix_historyEndDate', historyEndDate); }, [historyEndDate]);
+  useEffect(() => { 
+    if(selectedReportId) localStorage.setItem('analytix_selectedReportId', selectedReportId); 
+    else localStorage.removeItem('analytix_selectedReportId');
+  }, [selectedReportId]);
+  useEffect(() => { localStorage.setItem('analytix_savedFilters', JSON.stringify(savedFilters)); }, [savedFilters]);
+  useEffect(() => { 
+    try { 
+      // Drop rawText to prevent 5MB storage quota limits
+      const slimReports = reports.map(r => ({ ...r, rawText: '' }));
+      localStorage.setItem('analytix_reports', JSON.stringify(slimReports)); 
+    } catch(e) {}
+  }, [reports]);
 
   useEffect(() => {
     setExpandedLists(new Set());
   }, [selectedReportId]);
+
+  // Filter Handlers
+  const handleSaveFilter = () => {
+    if(!newFilterName.trim()) return;
+    const newFilter = { id: Date.now().toString(), name: newFilterName.trim(), start: historyStartDate, end: historyEndDate };
+    setSavedFilters(prev => [...prev, newFilter]);
+    setNewFilterName('');
+    setIsSavingFilter(false);
+  };
+
+  const applySavedFilter = (filter: {start: string, end: string}) => {
+    setHistoryStartDate(filter.start);
+    setHistoryEndDate(filter.end);
+  };
+
+  const removeSavedFilter = (id: string) => {
+    setSavedFilters(prev => prev.filter(f => f.id !== id));
+  };
 
   const toggleList = (listId: string) => {
     setExpandedLists(prev => {
@@ -171,7 +225,7 @@ export default function App() {
       // By default, Supabase anon keys do not have permission to run listBuckets().
       // Using the exact bucket name from your screenshot instead:
       const targetBuckets = ['Export_Calls'];
-      let allFiles: {bucket: string, name: string, id: string}[] = [];
+      let allFiles: {bucket: string, name: string, id: string, created_at: string}[] = [];
       
       for (const bucketName of targetBuckets) {
         const { data: files, error: filesError } = await supabase.storage.from(bucketName).list();
@@ -184,7 +238,7 @@ export default function App() {
           for (const f of files) {
              // Accept any file that isn't a hidden system placeholder like .emptyFolder
              if (f.name && !f.name.startsWith('.')) {
-                allFiles.push({ bucket: bucketName, name: f.name, id: f.id });
+                allFiles.push({ bucket: bucketName, name: f.name, id: f.id, created_at: f.created_at || new Date().toISOString() });
              }
           }
         }
@@ -251,9 +305,7 @@ export default function App() {
         filename: name,
         timestamp: Date.now(),
         rawText: text,
-        metrics,
-        startDate: '',
-        endDate: ''
+        metrics
       };
       
       setReports(prev => [newReport, ...prev]);
@@ -307,13 +359,23 @@ export default function App() {
     return { keepActive, deactivate, activate };
   }, [currentReport]);
 
-  const updateDateRange = (start: string, end: string) => {
-    if (!currentReport) return;
-    setReports(prev => prev.map(r => r.id === currentReport.id ? { ...r, startDate: start, endDate: end } : r));
-  };
-
-  const currentStartDate = currentReport?.startDate || '';
-  const currentEndDate = currentReport?.endDate || '';
+  const filteredFiles = useMemo(() => {
+    return supabaseFiles.filter(f => {
+      if (!f.created_at) return true;
+      
+      // Use local timezone for intuitive parsing
+      const d = new Date(f.created_at);
+      const year = d.getFullYear();
+      const month = String(d.getMonth() + 1).padStart(2, '0');
+      const day = String(d.getDate()).padStart(2, '0');
+      const fileDate = `${year}-${month}-${day}`;
+      
+      if (historyStartDate && fileDate < historyStartDate) return false;
+      if (historyEndDate && fileDate > historyEndDate) return false;
+      
+      return true;
+    }).sort((a,b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+  }, [supabaseFiles, historyStartDate, historyEndDate]);
 
   const exportData = () => {
     if (!currentReport) return;
@@ -323,7 +385,7 @@ export default function App() {
       ["Campaign Analytics Report"],
       ["Campaign", currentReport.metrics.campaignName],
       ["File Name", currentReport.filename],
-      ["Date Range", `${currentStartDate || 'N/A'} to ${currentEndDate || 'N/A'}`],
+      ["Date Range", `${historyStartDate || 'All Time'} to ${historyEndDate || 'All Time'}`],
       [""],
       ["Total Calls", currentReport.metrics.totalCalls],
       ["Total Sales", currentReport.metrics.totalSales],
@@ -407,7 +469,61 @@ export default function App() {
         </div>
 
         <nav className="flex-1 overflow-y-auto px-2 py-3 space-y-1">
-          <div className="text-[9px] font-bold text-slate-400 uppercase tracking-widest mb-2 px-2 flex justify-between">
+          <div className="mb-3 bg-slate-50 border border-slate-200 rounded p-2 mx-1 mt-1">
+            <div className="text-[9px] font-bold text-slate-400 uppercase tracking-widest mb-1.5 flex items-center gap-1">
+              <Calendar className="w-3 h-3" /> Filter History
+            </div>
+            <div className="flex items-center gap-1">
+              <input 
+                type="date" 
+                value={historyStartDate} 
+                onChange={(e) => setHistoryStartDate(e.target.value)}
+                className="bg-white border border-slate-200 outline-none text-[9px] text-slate-600 w-full rounded px-1.5 py-1"
+              />
+              <span className="text-slate-400 text-[10px]">-</span>
+              <input 
+                type="date" 
+                value={historyEndDate} 
+                onChange={(e) => setHistoryEndDate(e.target.value)}
+                className="bg-white border border-slate-200 outline-none text-[9px] text-slate-600 w-full rounded px-1.5 py-1"
+              />
+            </div>
+            
+            {/* Save Filter Area */}
+            <div className="mt-2 pt-2 border-t border-slate-100 flex flex-col gap-1.5">
+              {isSavingFilter ? (
+                <div className="flex w-full gap-1 items-center">
+                  <input autoFocus placeholder="Preset name..." className="bg-white border border-slate-200 rounded px-1.5 py-1 text-[9px] w-full outline-indigo-500" value={newFilterName} onChange={e => setNewFilterName(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && handleSaveFilter() } />
+                  <button onClick={handleSaveFilter} className="bg-indigo-600 text-white rounded p-1 hover:bg-indigo-700" title="Save">
+                    <Save className="w-3 h-3" />
+                  </button>
+                  <button onClick={() => setIsSavingFilter(false)} className="bg-slate-200 text-slate-600 rounded p-1 hover:bg-slate-300" title="Cancel">
+                    <X className="w-3 h-3" />
+                  </button>
+                </div>
+              ) : (
+                <button onClick={() => setIsSavingFilter(true)} className="flex items-center gap-1 text-[9px] text-indigo-600 font-medium hover:text-indigo-800 transition">
+                  <Bookmark className="w-3 h-3" /> Save Date Preset
+                </button>
+              )}
+
+              {/* List of Saved Filters */}
+              {savedFilters.length > 0 && (
+                <div className="flex flex-wrap gap-1 mt-1">
+                  {savedFilters.map(filter => (
+                    <div key={filter.id} className="flex items-center bg-indigo-50 text-indigo-700 border border-indigo-200 rounded text-[9px] px-1.5 py-0.5 group shrink-0 max-w-full">
+                      <span className="cursor-pointer font-medium hover:underline flex-1 truncate max-w-[80px]" title={`From ${filter.start || '...'} to ${filter.end || '...'}`} onClick={() => applySavedFilter(filter)}>
+                        {filter.name}
+                      </span>
+                      <Trash2 className="w-2.5 h-2.5 ml-1.5 opacity-50 cursor-pointer hover:opacity-100 hover:text-rose-500 shrink-0" onClick={() => removeSavedFilter(filter.id)} />
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="text-[9px] font-bold text-slate-400 uppercase tracking-widest mb-2 px-2 flex justify-between mt-4">
             Supabase Cloud Files
             <Cloud className="w-3 h-3" />
           </div>
@@ -419,12 +535,12 @@ export default function App() {
             </div>
           )}
 
-          {supabaseFiles.length === 0 && !syncError && !isLoadingSupabase ? (
+          {filteredFiles.length === 0 && !syncError && !isLoadingSupabase ? (
             <div className="text-[10px] text-slate-400 italic px-2 py-4 text-center">
               No files found in Export_Calls bucket.
             </div>
           ) : (
-            supabaseFiles.map(f => {
+            filteredFiles.map(f => {
               const reportHasLoadedLocally = reports.find(r => r.filename === f.name);
               const isActive = selectedReportId && reportHasLoadedLocally && selectedReportId === reportHasLoadedLocally.id;
               
@@ -437,9 +553,12 @@ export default function App() {
                   }`}
                 >
                   <FileText className={`w-3.5 h-3.5 mt-0.5 shrink-0 ${isActive ? 'text-indigo-600' : 'text-slate-400'}`} />
-                  <div className="flex flex-col min-w-0 pr-4">
+                  <div className="flex flex-col min-w-0 pr-4 w-full">
                     <span className="truncate w-full block font-semibold text-[10px]" title={f.name}>{f.name}</span>
-                    <span className="truncate w-full block text-[9px] text-slate-500 mt-0.5 border border-slate-200 bg-white px-1 py-0.5 rounded-sm inline-flex w-max">Bucket: {f.bucket}</span>
+                    <div className="flex justify-between items-center mt-1">
+                      <span className="truncate block text-[9px] text-slate-500 border border-slate-200 bg-white px-1 py-0.5 rounded-sm inline-flex w-max">{f.bucket}</span>
+                      <span className="text-[8px] text-slate-400">{formatDate(new Date(f.created_at).getTime())}</span>
+                    </div>
                   </div>
                   {reportHasLoadedLocally && (
                     <button 
@@ -469,24 +588,6 @@ export default function App() {
           </div>
           {currentReport && (
             <div className="flex items-center gap-2">
-              {/* Date Range Selection */}
-              <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded px-2 py-1">
-                <Calendar className="w-3 h-3 text-slate-400" />
-                <input 
-                  type="date" 
-                  value={currentStartDate} 
-                  onChange={(e) => updateDateRange(e.target.value, currentEndDate)}
-                  className="bg-transparent border-none outline-none text-[10px] text-slate-600 w-[100px]"
-                />
-                <span className="text-slate-400">-</span>
-                <input 
-                  type="date" 
-                  value={currentEndDate} 
-                  onChange={(e) => updateDateRange(currentStartDate, e.target.value)}
-                  className="bg-transparent border-none outline-none text-[10px] text-slate-600 w-[100px]"
-                />
-              </div>
-
               <button 
                 onClick={exportData}
                 className="flex items-center gap-1.5 px-3 py-1 text-emerald-700 bg-emerald-50 border border-emerald-200 hover:bg-emerald-100 rounded transition font-semibold text-[10px]"
@@ -665,7 +766,7 @@ export default function App() {
                                 <td colSpan={6} className="px-8 py-3">
                                   <div className="text-[9px] font-bold text-indigo-500 uppercase mb-2">Dispositions</div>
                                   <div className="grid grid-cols-3 md:grid-cols-6 gap-2">
-                                    {Object.entries(list.dispositions).sort((a,b)=>b[1]-a[1]).map(([d, c]) => (
+                                    {Object.entries(list.dispositions).sort((a,b)=>(b[1] as number)-(a[1] as number)).map(([d, c]) => (
                                       <div key={d} className="bg-white border border-slate-200 p-1.5 rounded flex justify-between items-center shadow-sm">
                                         <span className="text-[9px] font-bold text-slate-500 truncate pr-2" title={d}>{d}</span>
                                         <span className="text-[10px] font-mono font-bold text-indigo-800">{c}</span>
